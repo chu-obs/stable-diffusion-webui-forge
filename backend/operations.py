@@ -1,7 +1,8 @@
+import time
 import torch
 import contextlib
 
-from backend import stream
+from backend import stream, memory_management
 
 
 stash = {}
@@ -20,23 +21,25 @@ def weights_manual_cast(layer, x, skip_dtype=False):
     if skip_dtype:
         target_dtype = None
 
-    if stream.using_stream:
+    if stream.should_use_stream():
         with stream.stream_context()(stream.mover_stream):
+            if layer.weight is not None:
+                weight = layer.weight.to(device=target_device, dtype=target_dtype, non_blocking=non_blocking)
             if layer.bias is not None:
                 bias = layer.bias.to(device=target_device, dtype=target_dtype, non_blocking=non_blocking)
-            weight = layer.weight.to(device=target_device, dtype=target_dtype, non_blocking=non_blocking)
             signal = stream.mover_stream.record_event()
     else:
+        if layer.weight is not None:
+            weight = layer.weight.to(device=target_device, dtype=target_dtype, non_blocking=non_blocking)
         if layer.bias is not None:
             bias = layer.bias.to(device=target_device, dtype=target_dtype, non_blocking=non_blocking)
-        weight = layer.weight.to(device=target_device, dtype=target_dtype, non_blocking=non_blocking)
 
     return weight, bias, signal
 
 
 @contextlib.contextmanager
 def main_stream_worker(weight, bias, signal):
-    if not stream.using_stream or signal is None:
+    if signal is None or not stream.should_use_stream():
         yield
         return
 
@@ -57,7 +60,7 @@ def main_stream_worker(weight, bias, signal):
 
 
 def cleanup_cache():
-    if not stream.using_stream:
+    if not stream.should_use_stream():
         return
 
     stream.current_stream.synchronize()
@@ -301,4 +304,45 @@ def shift_manual_cast(model, enabled):
     for m in model.modules():
         if hasattr(m, 'parameters_manual_cast'):
             m.parameters_manual_cast = enabled
+    return
+
+
+@contextlib.contextmanager
+def automatic_memory_management():
+    memory_management.free_memory(
+        memory_required=3 * 1024 * 1024 * 1024,
+        device=memory_management.get_torch_device()
+    )
+
+    module_list = []
+
+    original_init = torch.nn.Module.__init__
+    original_to = torch.nn.Module.to
+
+    def patched_init(self, *args, **kwargs):
+        module_list.append(self)
+        return original_init(self, *args, **kwargs)
+
+    def patched_to(self, *args, **kwargs):
+        module_list.append(self)
+        return original_to(self, *args, **kwargs)
+
+    try:
+        torch.nn.Module.__init__ = patched_init
+        torch.nn.Module.to = patched_to
+        yield
+    finally:
+        torch.nn.Module.__init__ = original_init
+        torch.nn.Module.to = original_to
+
+    start = time.perf_counter()
+    module_list = set(module_list)
+
+    for module in module_list:
+        module.cpu()
+
+    memory_management.soft_empty_cache()
+    end = time.perf_counter()
+
+    print(f'Automatic Memory Management: {len(module_list)} Modules in {(end - start):.2f} seconds.')
     return

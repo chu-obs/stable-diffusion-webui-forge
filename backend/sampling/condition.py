@@ -89,6 +89,9 @@ class ConditionConstant(Condition):
 
 
 def compile_conditions(cond):
+    if cond is None:
+        return None
+
     if isinstance(cond, torch.Tensor):
         result = dict(
             cross_attn=cond,
@@ -109,6 +112,9 @@ def compile_conditions(cond):
             y=Condition(pooled_output)
         )
     )
+
+    if 'guidance' in cond:
+        result['model_conds']['guidance'] = Condition(cond['guidance'])
 
     return [result, ]
 

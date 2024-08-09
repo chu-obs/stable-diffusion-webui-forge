@@ -32,7 +32,8 @@ class StableDiffusionXL(ForgeDiffusionEngine):
 
         unet = UnetPatcher.from_model(
             model=huggingface_components['unet'],
-            diffusers_scheduler=huggingface_components['scheduler']
+            diffusers_scheduler=huggingface_components['scheduler'],
+            config=estimated_config
         )
 
         self.text_processing_engine_l = ClassicTextProcessingEngine(
@@ -72,7 +73,6 @@ class StableDiffusionXL(ForgeDiffusionEngine):
         # WebUI Legacy
         self.is_sdxl = True
         self.first_stage_model = vae.first_stage_model
-        self.alphas_cumprod = unet.model.predictor.alphas_cumprod
 
     def set_clip_skip(self, clip_skip):
         self.text_processing_engine_l.clip_skip = clip_skip

@@ -7,8 +7,9 @@ import huggingface_guess
 
 from diffusers import DiffusionPipeline
 from transformers import modeling_utils
-from backend import memory_management
 
+from backend import memory_management
+from backend.utils import read_arbitrary_config
 from backend.state_dict import try_filter_state_dict, load_state_dict
 from backend.operations import using_forge_operations
 from backend.nn.vae import IntegratedAutoencoderKL
@@ -18,9 +19,10 @@ from backend.nn.unet import IntegratedUNet2DConditionModel
 from backend.diffusion_engine.sd15 import StableDiffusion
 from backend.diffusion_engine.sd20 import StableDiffusion2
 from backend.diffusion_engine.sdxl import StableDiffusionXL
+from backend.diffusion_engine.flux import Flux
 
 
-possible_models = [StableDiffusion, StableDiffusion2, StableDiffusionXL]
+possible_models = [StableDiffusion, StableDiffusion2, StableDiffusionXL, Flux]
 
 
 logging.getLogger("diffusers").setLevel(logging.ERROR)
@@ -43,7 +45,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             with using_forge_operations(device=memory_management.cpu, dtype=memory_management.vae_dtype()):
                 model = IntegratedAutoencoderKL.from_config(config)
 
-            load_state_dict(model, state_dict)
+            load_state_dict(model, state_dict, ignore_start='loss.')
             return model
         if component_name.startswith('text_encoder') and cls_name in ['CLIPTextModel', 'CLIPTextModelWithProjection']:
             from transformers import CLIPTextConfig, CLIPTextModel
@@ -52,7 +54,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             to_args = dict(device=memory_management.text_encoder_device(), dtype=memory_management.text_encoder_dtype())
 
             with modeling_utils.no_init_weights():
-                with using_forge_operations(**to_args):
+                with using_forge_operations(**to_args, manual_cast_enabled=True):
                     model = IntegratedCLIP(CLIPTextModel, config, add_text_projection=True).to(**to_args)
 
             load_state_dict(model, state_dict, ignore_errors=[
@@ -63,8 +65,8 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
 
             return model
         if cls_name == 'T5EncoderModel':
-            from transformers import T5EncoderModel, T5Config
-            config = T5Config.from_pretrained(config_path)
+            from backend.nn.t5 import IntegratedT5
+            config = read_arbitrary_config(config_path)
 
             dtype = memory_management.text_encoder_dtype()
             sd_dtype = state_dict['transformer.encoder.block.0.layer.0.SelfAttention.k.weight'].dtype
@@ -73,10 +75,10 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 dtype = sd_dtype
 
             with modeling_utils.no_init_weights():
-                with using_forge_operations(device=memory_management.cpu, dtype=dtype):
-                    model = IntegratedCLIP(T5EncoderModel, config)
+                with using_forge_operations(device=memory_management.cpu, dtype=dtype, manual_cast_enabled=True):
+                    model = IntegratedT5(config)
 
-            load_state_dict(model, state_dict, log_name=cls_name)
+            load_state_dict(model, state_dict, log_name=cls_name, ignore_errors=['transformer.encoder.embed_tokens.weight'])
 
             return model
         if cls_name == 'UNet2DConditionModel':
@@ -84,13 +86,25 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             state_dict_size = memory_management.state_dict_size(state_dict)
             ini_dtype = memory_management.unet_dtype(model_params=state_dict_size)
             ini_device = memory_management.unet_inital_load_device(parameters=state_dict_size, dtype=ini_dtype)
+            to_args = dict(device=ini_device, dtype=ini_dtype)
 
-            unet_config['dtype'] = ini_dtype
-            unet_config['device'] = ini_device
-
-            with using_forge_operations(device=ini_device, dtype=ini_dtype):
-                model = IntegratedUNet2DConditionModel.from_config(unet_config)
+            with using_forge_operations(**to_args):
+                model = IntegratedUNet2DConditionModel.from_config(unet_config).to(**to_args)
                 model._internal_dict = unet_config
+
+            load_state_dict(model, state_dict)
+            return model
+        if cls_name == 'FluxTransformer2DModel':
+            from backend.nn.flux import IntegratedFluxTransformer2DModel
+            unet_config = guess.unet_config.copy()
+            state_dict_size = memory_management.state_dict_size(state_dict)
+            ini_dtype = memory_management.unet_dtype(model_params=state_dict_size)
+            ini_device = memory_management.unet_inital_load_device(parameters=state_dict_size, dtype=ini_dtype)
+            to_args = dict(device=ini_device, dtype=ini_dtype)
+
+            with using_forge_operations(**to_args):
+                model = IntegratedFluxTransformer2DModel(**unet_config).to(**to_args)
+                model.config = unet_config
 
             load_state_dict(model, state_dict)
             return model
@@ -99,13 +113,16 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
     return None
 
 
-def split_state_dict(sd):
+def split_state_dict(sd, sd_vae=None):
     guess = huggingface_guess.guess(sd)
     guess.clip_target = guess.clip_target(sd)
 
+    if sd_vae is not None:
+        print(f'Using external VAE state dict: {len(sd_vae)}')
+
     state_dict = {
         guess.unet_target: try_filter_state_dict(sd, guess.unet_key_prefix),
-        guess.vae_target: try_filter_state_dict(sd, guess.vae_key_prefix)
+        guess.vae_target: try_filter_state_dict(sd, guess.vae_key_prefix) if sd_vae is None else sd_vae
     }
 
     sd = guess.process_clip_state_dict(sd)
@@ -124,8 +141,8 @@ def split_state_dict(sd):
 
 
 @torch.no_grad()
-def forge_loader(sd):
-    state_dicts, estimated_config = split_state_dict(sd)
+def forge_loader(sd, sd_vae=None):
+    state_dicts, estimated_config = split_state_dict(sd, sd_vae=sd_vae)
     repo_name = estimated_config.huggingface_repo
 
     local_path = os.path.join(dir_path, 'huggingface', repo_name)
